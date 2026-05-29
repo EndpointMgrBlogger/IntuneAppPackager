@@ -321,11 +321,18 @@ if ($Setup) {
                 $intuneWin = Join-Path $OutputFolder "$baseName.intunewin"
 
                 if (Test-Path $intuneWin) {
-                    Write-OK "$appName — packaged successfully => $($baseName).intunewin"
+                    # Rename to folder name if PSADT — Invoke-AppDeployToolkit.intunewin is not meaningful
+                    if ($setupFile.Name -match '(?i)^(Invoke-AppDeployToolkit|Deploy-Application)\.ps1$') {
+                        Rename-Item -Path $intuneWin -NewName "$appName.intunewin" -Force
+                        $outputName = "$appName.intunewin"
+                    } else {
+                        $outputName = "$($baseName).intunewin"
+                    }
+                    Write-OK "$appName — packaged successfully => $outputName"
                     $packaged.Add([PSCustomObject]@{
                         AppName   = $appName
                         SetupFile = $setupFile.Name
-                        Output = "$($baseName).intunewin"
+                        Output    = $outputName
                     })
                 } else {
                     # Fall back: find any .intunewin that wasn't there before packaging
@@ -334,11 +341,18 @@ if ($Setup) {
                                Select-Object -First 1
 
                     if ($newFile) {
-                        Write-OK "$appName — packaged successfully => $($newFile.Name)"
+                        # Rename to folder name if PSADT — Invoke-AppDeployToolkit.intunewin is not meaningful
+                        if ($setupFile.Name -match '(?i)^(Invoke-AppDeployToolkit|Deploy-Application)\.ps1$') {
+                            Rename-Item -Path $newFile.FullName -NewName "$appName.intunewin" -Force
+                            $outputName = "$appName.intunewin"
+                        } else {
+                            $outputName = $newFile.Name
+                        }
+                        Write-OK "$appName — packaged successfully => $outputName"
                         $packaged.Add([PSCustomObject]@{
-                        AppName   = $appName
-                        SetupFile = $setupFile.Name
-                        Output = $newFile.Name 
+                            AppName   = $appName
+                            SetupFile = $setupFile.Name
+                            Output    = $outputName
                         })
                     } else {
                         Write-Warn "$appName — tool exited 0 but no new .intunewin found in output."
