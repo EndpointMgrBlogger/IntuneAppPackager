@@ -1,0 +1,13 @@
+  {
+    "name": "Adobe Acrobat Reader",
+    "publisher": "Adobe",
+    "version": "latest",
+    "description": "Adobe Acrobat Reader DC",
+    "installCommand": "AcroRdrDCx64.exe /sAll /rs /rps /msi /norestart /quiet EULA_ACCEPT=YES",
+    "uninstallCommand": "msiexec /x {AC76BA86-1033-FFFF-7760-BC15014EA700} /qn",
+    "installExperience": "system",
+    "detectionType": "registry",
+    "detectionKey": "HKLM:\\SOFTWARE\\Adobe\\Acrobat Reader",
+    "detectionValue": "Version",
+    "detectionVersion": "latest"
+  }

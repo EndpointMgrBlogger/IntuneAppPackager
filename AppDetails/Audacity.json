@@ -1,0 +1,13 @@
+  {
+    "name": "Audacity",
+    "publisher": "Audacity",
+    "version": "latest",
+    "description": "Audacity Audio Editor",
+    "installCommand": "audacity-win.exe /VERYSILENT /NORESTART",
+    "uninstallCommand": "\"C:\\Program Files\\Audacity\\unins000.exe\" /VERYSILENT /NORESTART",
+    "installExperience": "system",
+    "detectionType": "registry",
+    "detectionKey": "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Audacity",
+    "detectionValue": "DisplayVersion",
+    "detectionVersion": "latest"
+  }

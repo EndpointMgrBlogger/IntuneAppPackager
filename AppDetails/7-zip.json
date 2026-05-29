@@ -1,0 +1,13 @@
+{
+    "name": "7-Zip",
+    "publisher": "7-Zip",
+    "version": "latest",
+    "description": "7-Zip File Archiver",
+    "installCommand": "7z2409-x64.exe /S",
+    "uninstallCommand": "msiexec /x {23170F69-40C1-2702-2409-000001000000} /qn",
+    "installExperience": "system",
+    "detectionType": "registry",
+    "detectionKey": "HKLM:\\SOFTWARE\\7-Zip",
+    "detectionValue": "Path",
+    "detectionVersion": "latest"
+  }

@@ -1,0 +1,6 @@
+{
+  "detectionType": "registry",
+  "detectionKey": "HKLM:\\SOFTWARE\\endpointmgt\\Backgrounds",
+  "detectionValue": "AppVersion",
+  "detectionVersion": "1"
+}
