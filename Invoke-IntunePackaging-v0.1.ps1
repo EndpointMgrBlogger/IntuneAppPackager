@@ -105,12 +105,13 @@ function Test-AdminRights {
 
 function Select-SetupFile {
     # Resolution order per extension:
-    #   1. Exact folder-name match  (e.g. folder = "VLC",  file = "VLC.exe")
-    #   2. Name contains folder name as substring (e.g. Install-VLC.ps1)
-    #   3. Name contains "install"  — uninstall files already stripped
-    #   4. Name contains "setup"    (e.g. setup.msi)
-    #   5. Only one file remains after stripping uninstallers
-    # Uninstall/remove/cleanup files are always excluded first.
+    #   1. Known PSADT entry points (Invoke-AppDeployToolkit.ps1 / Deploy-Application.ps1)
+    #   2. Exact folder-name match       (e.g. folder = "VLC", file = "VLC.exe")
+    #   3. Name contains folder name     (e.g. Install-VLC.ps1)
+    #   4. Name contains "install"       — uninstall files already stripped
+    #   5. Name contains "setup"         (e.g. setup.msi)
+    #   6. Only one file remains
+    # Uninstall/remove/cleanup/uninst files are always excluded first.
 
     param([System.IO.FileInfo[]]$Candidates, [string]$AppName, [string]$AppNameNorm)
 
@@ -121,27 +122,33 @@ function Select-SetupFile {
 
     if (-not $filtered) { return $null }
 
-    # Priority 1 — filename (without extension) matches folder name exactly (case-insensitive)
+    # Priority 1 — known PSADT entry points (v4 and v3)
+    $psadt = $filtered | Where-Object {
+        $_.Name -match '(?i)^(Invoke-AppDeployToolkit|Deploy-Application)\.ps1$'
+    }
+    if (@($psadt).Count -eq 1) { return $psadt[0] }
+
+    # Priority 2 — filename (without extension) matches folder name exactly (case-insensitive)
     $exact = $filtered | Where-Object {
         ($_.BaseName -replace '[\s\-_]', '') -eq $AppNameNorm
     }
     if (@($exact).Count -eq 1) { return $exact[0] }
 
-    # Priority 2 — filename contains the folder name as a substring
+    # Priority 3 — filename contains the folder name as a substring
     $nameMatch = $filtered | Where-Object {
         ($_.BaseName -replace '[\s\-_]', '') -match "(?i)$([regex]::Escape($AppNameNorm))"
     }
     if (@($nameMatch).Count -eq 1) { return $nameMatch[0] }
 
-    # Priority 3 — filename contains "install" (uninstall already filtered above)
+    # Priority 4 — filename contains "install" (uninstall already filtered above)
     $installMatch = $filtered | Where-Object { $_.BaseName -match '(?i)install' }
     if (@($installMatch).Count -eq 1) { return $installMatch[0] }
 
-    # Priority 4 — filename contains "setup"
+    # Priority 5 — filename contains "setup"
     $setupMatch = $filtered | Where-Object { $_.BaseName -match '(?i)setup' }
     if (@($setupMatch).Count -eq 1) { return $setupMatch[0] }
 
-    # Priority 5 — only one file remains after stripping uninstallers
+    # Priority 6 — only one file remains after stripping uninstallers
     if (@($filtered).Count -eq 1) { return $filtered[0] }
 
     # More than one candidate and no clear winner
