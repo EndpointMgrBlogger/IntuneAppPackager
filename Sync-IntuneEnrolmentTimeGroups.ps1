@@ -71,6 +71,10 @@
     Do not query deviceManagement/autopilotEvents. Autopilot device preparation devices
     will then only be matched on managedDevice.enrollmentProfileName.
 
+.PARAMETER Diagnose
+    Print what every enrolment time grouping call actually returned, including the calls
+    that are otherwise swallowed. Use this when profiles are found but no groups are.
+
 .PARAMETER GraphScopes
     Override the delegated permission scopes requested at sign-in.
 
@@ -89,6 +93,11 @@
 .EXAMPLE
     .\Sync-IntuneEnrolmentTimeGroups.ps1 -TenantId contoso.onmicrosoft.com -ProfileType AppleEnrolment -WhatIf
     Apple enrolment profiles only, showing what would be changed.
+
+.EXAMPLE
+    .\Sync-IntuneEnrolmentTimeGroups.ps1 -TenantId contoso.onmicrosoft.com -Diagnose
+    Show the raw result of every enrolment time grouping call. Use this when you know a
+    profile has a group but the script reports none.
 
 .NOTES
     Delegated permissions required:
@@ -136,6 +145,9 @@ param (
     [switch]$SkipAutopilotEvents,
 
     [Parameter()]
+    [switch]$Diagnose,
+
+    [Parameter()]
     [string[]]$GraphScopes = @(
         'https://graph.microsoft.com/DeviceManagementConfiguration.Read.All'
         'https://graph.microsoft.com/DeviceManagementServiceConfig.Read.All'
@@ -167,6 +179,7 @@ $DeviceGroupSettingPattern = '(?i)(devicegroup|device_group|devicemembership)'
 # The Cache suffix matters: PowerShell variable names are case-insensitive, so a bare
 # $script:EntraDevice would be the same variable as a local $entraDevice in the main body.
 $script:TokenCache       = $null
+$script:LastGraphError   = $null   # last error swallowed by a -Quiet Graph call
 $script:EntraDeviceCache = @{}   # Entra deviceId (GUID) -> Entra device object
 $script:GroupInfoCache   = @{}   # group object id       -> group object
 $script:GroupMemberCache = @{}   # group object id       -> hashtable of member deviceId -> object id
@@ -207,6 +220,13 @@ function Write-Fail {
 function Write-Info {
     param([string]$Text)
     Write-Host "     $Text" -ForegroundColor DarkGray
+}
+
+function Write-Diag {
+    # Only speaks under -Diagnose. Used to show exactly what Graph returned for each
+    # enrolment time grouping probe, including calls that are otherwise swallowed.
+    param([string]$Text)
+    if ($Diagnose) { Write-Host "  ?? $Text" -ForegroundColor DarkCyan }
 }
 
 # ============================================================
@@ -421,7 +441,6 @@ function Invoke-GraphApi {
                     Headers     = @{
                         Authorization = "Bearer $(Get-GraphToken)"
                         Accept        = 'application/json'
-                        ConsistencyLevel = 'eventual'
                     }
                     ErrorAction = 'Stop'
                 }
@@ -443,10 +462,20 @@ function Invoke-GraphApi {
                     continue
                 }
 
-                if ($Quiet) { return $null }
-
                 $body    = Get-ErrorBody $_
                 $message = if ($body.error.message) { $body.error.message } else { $_.Exception.Message }
+
+                # Recorded so -Quiet callers can still explain themselves under -Diagnose
+                $script:LastGraphError = [PSCustomObject]@{
+                    Method  = $Method
+                    Uri     = $nextLink
+                    Status  = $status
+                    Message = $message
+                    Raw     = if ($_.ErrorDetails) { $_.ErrorDetails.Message } else { $null }
+                }
+
+                if ($Quiet) { return $null }
+
                 throw "Graph $Method $nextLink failed (HTTP $status): $message"
             }
         }
@@ -465,6 +494,48 @@ function Invoke-GraphApi {
 # ============================================================
 #  Enrolment profile discovery
 # ============================================================
+function Get-TargetIdFromObject {
+    <#
+        Walks any object graph and returns every GUID held in a property called targetId
+        (or groupId / enrollmentTimeAzureAdGroupIds).
+
+        The retrieve action has shipped more than one response shape — the group has
+        appeared under enrollmentTimeDeviceMembershipTargetValidationStatuses, under
+        enrollmentTimeDeviceMembershipTargets, and sometimes unwrapped. Harvesting by
+        property name rather than by path means a shape change does not silently
+        produce "no groups".
+    #>
+    param($Node, [int]$Depth = 0)
+
+    $found = [System.Collections.Generic.List[string]]::new()
+    if ($null -eq $Node -or $Depth -gt 12) { return $found }
+
+    # Strings are IEnumerable, so they have to be ruled out before the collection branch
+    if ($Node -is [string] -or $Node -is [ValueType]) { return $found }
+
+    if ($Node -is [System.Collections.IEnumerable]) {
+        foreach ($item in $Node) {
+            foreach ($v in (Get-TargetIdFromObject -Node $item -Depth ($Depth + 1))) { $found.Add($v) }
+        }
+        return $found
+    }
+
+    foreach ($property in $Node.PSObject.Properties) {
+        if ($property.Name -match '(?i)^(targetId|groupId|enrollmentTimeAzureAdGroupIds)$') {
+            # Matched on property name, so any non-empty value is taken as-is rather than
+            # being held to a GUID shape. A value that is not a real group is caught later
+            # by the group lookup, which says so — better than dropping it silently here.
+            foreach ($candidate in @($property.Value)) {
+                if ($candidate -is [string] -and $candidate.Trim()) { $found.Add($candidate.Trim()) }
+            }
+        } elseif ($property.Value) {
+            foreach ($v in (Get-TargetIdFromObject -Node $property.Value -Depth ($Depth + 1))) { $found.Add($v) }
+        }
+    }
+
+    return $found
+}
+
 function Get-EtgTargetFromAction {
     <#
         Calls retrieveEnrollmentTimeDeviceMembershipTarget on a resource and returns the
@@ -476,29 +547,40 @@ function Get-EtgTargetFromAction {
         POST /deviceManagement/androidDeviceOwnerEnrollmentProfiles/{id}/retrieveEnrollmentTimeDeviceMembershipTarget
     #>
     param(
-        [Parameter(Mandatory = $true)][string]$ResourceUri
+        [Parameter(Mandatory = $true)][string]$ResourceUri,
+        [string]$Label = ''
     )
 
     $groupIds = [System.Collections.Generic.List[string]]::new()
+    $uri      = "$ResourceUri/retrieveEnrollmentTimeDeviceMembershipTarget"
 
-    # Not every enrolment resource supports the action — a failure here just means
-    # "no enrolment time grouping", so the call is made quietly.
-    $result = Invoke-GraphApi -Uri "$ResourceUri/retrieveEnrollmentTimeDeviceMembershipTarget" -Method POST -Quiet
+    # Not every enrolment resource supports the action — a failure here usually just means
+    # "no enrolment time grouping", so the call is made quietly and surfaced by -Diagnose.
+    # The action takes no body, but some Graph hosts reject a POST with no content type,
+    # so an empty JSON document is sent first and a bodyless POST is the fallback.
+    $script:LastGraphError = $null
+    $result = Invoke-GraphApi -Uri $uri -Method POST -Body '{}' -Quiet
 
-    if (-not $result) { return $groupIds }
-
-    $payload = if ($result.value) { $result.value } else { $result }
-
-    foreach ($status in @($payload.enrollmentTimeDeviceMembershipTargetValidationStatuses)) {
-        if ($status.targetId) { $groupIds.Add([string]$status.targetId) }
-    }
-
-    # Older/alternate shape — a plain target collection
-    foreach ($target in @($payload.enrollmentTimeDeviceMembershipTargets)) {
-        if ($target.targetId -and $groupIds -notcontains $target.targetId) {
-            $groupIds.Add([string]$target.targetId)
+    if (-not $result) {
+        $firstError = $script:LastGraphError
+        $result = Invoke-GraphApi -Uri $uri -Method POST -Quiet
+        if (-not $result) {
+            Write-Diag "$Label retrieveEnrollmentTimeDeviceMembershipTarget failed."
+            Write-Diag "  with body {} : HTTP $($firstError.Status) $($firstError.Message)"
+            Write-Diag "  without body : HTTP $($script:LastGraphError.Status) $($script:LastGraphError.Message)"
+            if ($firstError.Raw) { Write-Diag "  response     : $($firstError.Raw)" }
+            return $groupIds
         }
     }
+
+    Write-Diag "$Label retrieveEnrollmentTimeDeviceMembershipTarget returned:"
+    Write-Diag "  $($result | ConvertTo-Json -Depth 10 -Compress)"
+
+    foreach ($id in (Get-TargetIdFromObject -Node $result)) {
+        if ($groupIds -notcontains $id) { $groupIds.Add($id) }
+    }
+
+    if ($groupIds.Count -eq 0) { Write-Diag "$Label no targetId found in the response." }
 
     return $groupIds
 }
@@ -577,20 +659,30 @@ function Get-EnrolmentPolicyGroup {
     foreach ($policy in $enrolmentPolicies) {
 
         $groupIds = [System.Collections.Generic.List[string]]::new()
+        $label    = "[policy '$($policy.name)']"
 
-        foreach ($id in (Get-EtgTargetFromAction -ResourceUri "$GraphBeta/deviceManagement/configurationPolicies('$($policy.id)')")) {
+        Write-Diag "$label id=$($policy.id) platforms=$($policy.platforms) technologies=$($policy.technologies) templateFamily=$($policy.templateReference.templateFamily)"
+
+        foreach ($id in (Get-EtgTargetFromAction -ResourceUri "$GraphBeta/deviceManagement/configurationPolicies('$($policy.id)')" -Label $label)) {
             if ($groupIds -notcontains $id) { $groupIds.Add($id) }
         }
 
         # Autopilot device preparation stores its group as a policy setting as well
         $settings = Invoke-GraphApi -All -Quiet -Uri "$GraphBeta/deviceManagement/configurationPolicies('$($policy.id)')/settings"
+        if ($null -eq $settings) {
+            Write-Diag "$label settings could not be read: HTTP $($script:LastGraphError.Status) $($script:LastGraphError.Message)"
+        }
         foreach ($setting in @($settings)) {
+            Write-Diag "$label setting $($setting.settingInstance.settingDefinitionId)"
             foreach ($id in (Get-GuidValueFromSetting -Instance $setting.settingInstance)) {
                 if ($groupIds -notcontains $id) { $groupIds.Add($id) }
             }
         }
 
-        if ($groupIds.Count -eq 0) { continue }
+        if ($groupIds.Count -eq 0) {
+            Write-Diag "$label no enrolment time group found."
+            continue
+        }
 
         $platform = [string]$policy.platforms
         $type = if ($platform -match '(?i)windows') {
@@ -639,7 +731,10 @@ function Get-AndroidEnrolmentProfileGroup {
 
     foreach ($enrolProfile in $profiles) {
 
-        $groupIds = @(Get-EtgTargetFromAction -ResourceUri "$GraphBeta/deviceManagement/androidDeviceOwnerEnrollmentProfiles/$($enrolProfile.id)")
+        $label = "[android '$($enrolProfile.displayName)']"
+        Write-Diag "$label id=$($enrolProfile.id) enrollmentMode=$($enrolProfile.enrollmentMode)"
+
+        $groupIds = @(Get-EtgTargetFromAction -ResourceUri "$GraphBeta/deviceManagement/androidDeviceOwnerEnrollmentProfiles/$($enrolProfile.id)" -Label $label)
         if ($groupIds.Count -eq 0) { continue }
 
         $output.Add([PSCustomObject]@{
@@ -681,22 +776,49 @@ function Get-AppleEnrolmentProfileGroup {
 
     foreach ($depToken in $tokens) {
 
-        $profiles = Invoke-GraphApi -All -Quiet -Uri "$GraphBeta/deviceManagement/depOnboardingSettings/$($depToken.id)/enrollmentProfiles"
-        if ($null -eq $profiles) { continue }
+        $profileUri = "$GraphBeta/deviceManagement/depOnboardingSettings/$($depToken.id)/enrollmentProfiles"
+        $profiles   = Invoke-GraphApi -All -Quiet -Uri $profileUri
+
+        if ($null -eq $profiles) {
+            Write-Warn "Enrolment profiles for token '$($depToken.tokenName)' could not be read: HTTP $($script:LastGraphError.Status) $($script:LastGraphError.Message)"
+            continue
+        }
+
+        Write-Info "$(@($profiles).Count) profile(s) under token '$($depToken.tokenName)'."
 
         foreach ($enrolProfile in $profiles) {
+
+            $label = "[apple '$($enrolProfile.displayName)']"
+            Write-Diag "$label id=$($enrolProfile.id) type=$($enrolProfile.'@odata.type')"
+            Write-Diag "  $($enrolProfile | ConvertTo-Json -Depth 6 -Compress)"
 
             $groupIds = @($enrolProfile.enrollmentTimeAzureAdGroupIds)
 
             # The collection response can omit derived-type properties — re-read the
             # single profile before deciding there is no group.
             if (-not $groupIds -or $groupIds.Count -eq 0) {
-                $full = Invoke-GraphApi -Quiet -Uri "$GraphBeta/deviceManagement/depOnboardingSettings/$($depToken.id)/enrollmentProfiles/$($enrolProfile.id)"
-                if ($full) { $groupIds = @($full.enrollmentTimeAzureAdGroupIds) }
+                $full = Invoke-GraphApi -Quiet -Uri "$profileUri/$($enrolProfile.id)"
+                if ($full) {
+                    Write-Diag "$label single GET: $($full | ConvertTo-Json -Depth 6 -Compress)"
+                    $groupIds = @($full.enrollmentTimeAzureAdGroupIds)
+                } else {
+                    Write-Diag "$label single GET failed: HTTP $($script:LastGraphError.Status) $($script:LastGraphError.Message)"
+                }
+            }
+
+            # Classic ADE profiles are not documented as supporting the retrieve action,
+            # but tenants moved onto the newer enrolment experience do answer it, so it is
+            # worth a quiet attempt before giving up on the profile.
+            $groupIds = @($groupIds | Where-Object { $_ })
+            if ($groupIds.Count -eq 0) {
+                $groupIds = @(Get-EtgTargetFromAction -ResourceUri "$profileUri/$($enrolProfile.id)" -Label $label)
             }
 
             $groupIds = @($groupIds | Where-Object { $_ })
-            if ($groupIds.Count -eq 0) { continue }
+            if ($groupIds.Count -eq 0) {
+                Write-Diag "$label no enrolment time group found."
+                continue
+            }
 
             $output.Add([PSCustomObject]@{
                 ProfileType = 'AppleEnrolment'
@@ -979,6 +1101,10 @@ $profiles = @($profiles | Where-Object {
 if ($profiles.Count -eq 0) {
     Write-Host ""
     Write-Warn "No enrolment profiles with enrolment time grouping were found for the selected types."
+    if (-not $Diagnose) {
+        Write-Info "Profiles were found but none reported a group. Re-run with -Diagnose to see"
+        Write-Info "exactly what each enrolment time grouping call returned."
+    }
     Write-Host ""
     exit 0
 }

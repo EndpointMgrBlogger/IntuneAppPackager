@@ -183,6 +183,7 @@ directory object ID resolved from `managedDevice.azureADDeviceId`.
 | `-Force` | Skip the per-device confirmation prompt |
 | `-ReportPath` | Export the full result set to CSV |
 | `-SkipAutopilotEvents` | Skip the Autopilot events query |
+| `-Diagnose` | Print what every enrolment time grouping call actually returned |
 | `-WhatIf` | Show what would be added without adding it |
 
 The script also returns the result objects to the pipeline, so you can filter them
@@ -218,4 +219,22 @@ $r | Where-Object Status -eq 'Missing' | Group-Object GroupName
 - The Intune `/beta` endpoints are used where the enrolment time grouping APIs only exist
   in beta. Microsoft can change those without notice.
 - Throttling (HTTP 429) and transient 5xx responses are retried with `Retry-After`.
+
+### Profiles are found but no groups are
+
+```powershell
+.\Sync-IntuneEnrolmentTimeGroups.ps1 -TenantId contoso.onmicrosoft.com -Diagnose
+```
+
+`-Diagnose` prints, for every profile, the raw result of its enrolment time grouping
+call — including the HTTP status and error body of calls that are otherwise swallowed.
+That distinguishes the three causes that look identical without it:
+
+- the profile genuinely has no group attached,
+- the call was rejected (permissions, or the resource does not support the action),
+- the group is there but arrived in a response shape the parser did not expect.
+
+Group IDs are harvested by property name (`targetId`, `groupId`,
+`enrollmentTimeAzureAdGroupIds`) anywhere in the response rather than by a fixed path,
+so a shape change reports a missing group loudly instead of returning an empty result.
 
