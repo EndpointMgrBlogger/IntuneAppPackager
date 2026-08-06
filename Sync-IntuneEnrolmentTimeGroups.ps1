@@ -177,7 +177,7 @@ param (
 # ============================================================
 #  Shared config
 # ============================================================
-$ScriptVersion = '1.3.0'
+$ScriptVersion = '1.4.0'
 
 $GraphBeta   = 'https://graph.microsoft.com/beta'
 $GraphV1     = 'https://graph.microsoft.com/v1.0'
@@ -594,11 +594,16 @@ function Get-EtgTarget {
         [PSCustomObject]@{ Method = 'GET';  Segment = $null; Expand = 'enrollmentTimeDeviceMembershipTarget';         Body = $null; RequireHit = $true }
     )
 
+    # A cached entry is only trusted to narrow the probe once a variant has actually
+    # produced a group. A variant that merely answered could be a URL that happens to
+    # return 200 - locking that in would hide the real endpoint for every later profile.
     if ($script:EtgEndpointCache.ContainsKey($CollectionKey)) {
-        $known = $script:EtgEndpointCache[$CollectionKey]
-        if ($null -eq $known) { return $groupIds }   # already established that nothing answers here
-        $candidates = @($known)
+        $cached = $script:EtgEndpointCache[$CollectionKey]
+        if ($null -eq $cached) { return $groupIds }        # nothing answers on this collection
+        if ($cached.Confirmed) { $candidates = @($cached.Candidate) }
     }
+
+    $tentative = $null
 
     foreach ($candidate in $candidates) {
 
@@ -622,26 +627,35 @@ function Get-EtgTarget {
             if ($hits -notcontains $id) { $hits.Add($id) }
         }
 
-        if ($candidate.RequireHit -and $hits.Count -eq 0) {
-            Write-Diag "$Label $describe -> answered but produced no group, not treating it as the endpoint."
-            continue
+        if ($hits.Count -gt 0) {
+            Write-Diag "$Label $describe -> $($result | ConvertTo-Json -Depth 10 -Compress)"
+            $wasConfirmed = $script:EtgEndpointCache.ContainsKey($CollectionKey) -and
+                            $script:EtgEndpointCache[$CollectionKey].Confirmed
+            $script:EtgEndpointCache[$CollectionKey] = [PSCustomObject]@{ Candidate = $candidate; Confirmed = $true }
+            if (-not $wasConfirmed) {
+                Write-Info "Enrolment time grouping on $CollectionKey is served by: $describe"
+            }
+            return $hits
         }
 
-        Write-Diag "$Label $describe -> $($result | ConvertTo-Json -Depth 10 -Compress)"
-
-        if (-not $script:EtgEndpointCache.ContainsKey($CollectionKey)) {
-            $script:EtgEndpointCache[$CollectionKey] = $candidate
-            Write-Info "Enrolment time grouping on $CollectionKey is served by: $describe"
-        }
-
-        return $hits
+        # Answered, but with no group. That is either the right endpoint on a profile that
+        # genuinely has none, or a URL that happens to return 200. Remember it and keep
+        # probing; only a variant that produces a group is trusted to narrow later probes.
+        Write-Diag "$Label $describe -> answered with no group configured."
+        if (-not $candidate.RequireHit -and -not $tentative) { $tentative = $candidate }
     }
 
-    if (-not $script:EtgEndpointCache.ContainsKey($CollectionKey)) {
-        $script:EtgEndpointCache[$CollectionKey] = $null
-        Write-Warn "No enrolment time grouping endpoint on $CollectionKey answered in this tenant."
-        Write-Info "Run with -Diagnose to see each attempt, or supply -GroupMap to map profiles to groups by hand."
+    if ($script:EtgEndpointCache.ContainsKey($CollectionKey)) { return $groupIds }
+
+    if ($tentative) {
+        # Kept unconfirmed, so the full list is retried until something yields a group
+        $script:EtgEndpointCache[$CollectionKey] = [PSCustomObject]@{ Candidate = $tentative; Confirmed = $false }
+        return $groupIds
     }
+
+    $script:EtgEndpointCache[$CollectionKey] = $null
+    Write-Warn "No enrolment time grouping endpoint on $CollectionKey answered in this tenant."
+    Write-Info "Run with -Diagnose to see each attempt, or supply -GroupMap to map profiles to groups by hand."
 
     return $groupIds
 }

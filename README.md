@@ -155,7 +155,7 @@ Sign-in prints a code and a URL — open it, sign in as an admin, and the script
 
 | Profile type | Graph source | Where the group comes from |
 |--------------|--------------|----------------------------|
-| Autopilot device preparation | `deviceManagement/configurationPolicies` | `retrieveEnrollmentTimeDeviceMembershipTarget`, plus the `enrollment_autopilot_dpp_devicegroup` policy setting |
+| Autopilot device preparation | `deviceManagement/configurationPolicies` | `retrieveEnrollmentTimeDeviceMembershipTarget`, plus the `enrollment_autopilot_dpp_devicegroup` policy setting where present |
 | Apple enrolment policies (new ADE experience) | `deviceManagement/configurationPolicies` | `retrieveEnrollmentTimeDeviceMembershipTarget` |
 | Apple ADE profiles (classic) | `deviceManagement/depOnboardingSettings/{id}/enrollmentProfiles` | `enrollmentTimeAzureAdGroupIds` |
 | Android Enterprise | `deviceManagement/androidDeviceOwnerEnrollmentProfiles` | `retrieveEnrollmentTimeDeviceMembershipTarget` |
@@ -256,8 +256,12 @@ GET https://graph.microsoft.com/beta/deviceManagement/androidDeviceOwnerEnrollme
 ```
 
 so `GET` is tried first, then POST with and without a body, the `get` name, the fully
-qualified action name, the navigation property, and an `$expand`. Whichever answers is
-cached per collection, so the probe cost is paid once. When one works it says so:
+qualified action name, the navigation property, and an `$expand`.
+
+A variant is only accepted as the endpoint once it has actually returned a group. One
+that merely answers `200` might be a URL that happens to respond, and trusting it would
+hide the real endpoint for every later profile in that collection. Once a variant proves
+itself it is cached, so the probe cost is paid once, and it says so:
 
 ```
 Enrolment time grouping on configurationPolicies is served by: GET retrieveEnrollmentTimeDeviceMembershipTarget
