@@ -75,6 +75,14 @@
     Print what every enrolment time grouping call actually returned, including the calls
     that are otherwise swallowed. Use this when profiles are found but no groups are.
 
+.PARAMETER GroupMap
+    Map profile names to enrolment time group object IDs by hand, for when the group is
+    set in the portal but Graph will not return it. Keys are matched with -like, so
+    exact names and wildcards both work. Mapped groups are merged with any the script
+    discovered on its own.
+
+        -GroupMap @{ 'DP_Cope' = 'aaaa-...'; 'IOS_*' = @('bbbb-...','cccc-...') }
+
 .PARAMETER GraphScopes
     Override the delegated permission scopes requested at sign-in.
 
@@ -93,6 +101,11 @@
 .EXAMPLE
     .\Sync-IntuneEnrolmentTimeGroups.ps1 -TenantId contoso.onmicrosoft.com -ProfileType AppleEnrolment -WhatIf
     Apple enrolment profiles only, showing what would be changed.
+
+.EXAMPLE
+    .\Sync-IntuneEnrolmentTimeGroups.ps1 -TenantId contoso.onmicrosoft.com -Remediate ``
+        -GroupMap @{ 'DP_Cope' = '11111111-2222-3333-4444-555555555555' }
+    Supply the group by hand when the tenant will not return it, then remediate normally.
 
 .EXAMPLE
     .\Sync-IntuneEnrolmentTimeGroups.ps1 -TenantId contoso.onmicrosoft.com -Diagnose
@@ -148,6 +161,9 @@ param (
     [switch]$Diagnose,
 
     [Parameter()]
+    [hashtable]$GroupMap,
+
+    [Parameter()]
     [string[]]$GraphScopes = @(
         'https://graph.microsoft.com/DeviceManagementConfiguration.Read.All'
         'https://graph.microsoft.com/DeviceManagementServiceConfig.Read.All'
@@ -183,6 +199,7 @@ $script:LastGraphError   = $null   # last error swallowed by a -Quiet Graph call
 $script:EntraDeviceCache = @{}   # Entra deviceId (GUID) -> Entra device object
 $script:GroupInfoCache   = @{}   # group object id       -> group object
 $script:GroupMemberCache = @{}   # group object id       -> hashtable of member deviceId -> object id
+$script:EtgEndpointCache = @{}   # collection name       -> the ETG endpoint variant that answered
 
 # ============================================================
 #  Output helpers
@@ -536,51 +553,91 @@ function Get-TargetIdFromObject {
     return $found
 }
 
-function Get-EtgTargetFromAction {
+function Get-EtgTarget {
     <#
-        Calls retrieveEnrollmentTimeDeviceMembershipTarget on a resource and returns the
-        configured group object IDs. Used by settings catalog enrolment policies
-        (Autopilot device preparation, Apple enrolment policies) and by Android
-        Enterprise enrolment profiles.
+        Returns the enrolment time group object IDs configured against a resource.
 
-        POST /deviceManagement/configurationPolicies/{id}/retrieveEnrollmentTimeDeviceMembershipTarget
-        POST /deviceManagement/androidDeviceOwnerEnrollmentProfiles/{id}/retrieveEnrollmentTimeDeviceMembershipTarget
+        The documented call is
+            POST /deviceManagement/configurationPolicies/{id}/retrieveEnrollmentTimeDeviceMembershipTarget
+            POST /deviceManagement/androidDeviceOwnerEnrollmentProfiles/{id}/retrieveEnrollmentTimeDeviceMembershipTarget
+
+        but tenants have been seen rejecting it with
+            "No OData route exists that match template ~/singleton/navigation/key/action
+             with http verb POST"
+        which says the action is in the model but no route is registered for that verb
+        and shape. Rather than assume one form, the plausible variants are probed in
+        order and the first that answers is cached per collection, so the cost is paid
+        once and every later profile uses the variant this tenant actually serves.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$ResourceUri,
+        [Parameter(Mandatory = $true)][string]$CollectionKey,
         [string]$Label = ''
     )
 
     $groupIds = [System.Collections.Generic.List[string]]::new()
-    $uri      = "$ResourceUri/retrieveEnrollmentTimeDeviceMembershipTarget"
 
-    # Not every enrolment resource supports the action — a failure here usually just means
-    # "no enrolment time grouping", so the call is made quietly and surfaced by -Diagnose.
-    # The action takes no body, but some Graph hosts reject a POST with no content type,
-    # so an empty JSON document is sent first and a bodyless POST is the fallback.
-    $script:LastGraphError = $null
-    $result = Invoke-GraphApi -Uri $uri -Method POST -Body '{}' -Quiet
+    $candidates = @(
+        [PSCustomObject]@{ Method = 'POST'; Segment = 'retrieveEnrollmentTimeDeviceMembershipTarget';                 Body = '{}';  Expand = $null; RequireHit = $false }
+        [PSCustomObject]@{ Method = 'POST'; Segment = 'retrieveEnrollmentTimeDeviceMembershipTarget';                 Body = $null; Expand = $null; RequireHit = $false }
+        [PSCustomObject]@{ Method = 'GET';  Segment = 'retrieveEnrollmentTimeDeviceMembershipTarget';                 Body = $null; Expand = $null; RequireHit = $false }
+        [PSCustomObject]@{ Method = 'POST'; Segment = 'microsoft.graph.retrieveEnrollmentTimeDeviceMembershipTarget'; Body = '{}';  Expand = $null; RequireHit = $false }
+        [PSCustomObject]@{ Method = 'GET';  Segment = 'getEnrollmentTimeDeviceMembershipTarget';                      Body = $null; Expand = $null; RequireHit = $false }
+        [PSCustomObject]@{ Method = 'POST'; Segment = 'getEnrollmentTimeDeviceMembershipTarget';                      Body = '{}';  Expand = $null; RequireHit = $false }
+        [PSCustomObject]@{ Method = 'GET';  Segment = 'enrollmentTimeDeviceMembershipTarget';                         Body = $null; Expand = $null; RequireHit = $false }
+        # Last resort. A GET of the resource itself always succeeds, so this variant only
+        # counts as the winner if the expand actually produced a group.
+        [PSCustomObject]@{ Method = 'GET';  Segment = $null; Expand = 'enrollmentTimeDeviceMembershipTarget';         Body = $null; RequireHit = $true }
+    )
 
-    if (-not $result) {
-        $firstError = $script:LastGraphError
-        $result = Invoke-GraphApi -Uri $uri -Method POST -Quiet
-        if (-not $result) {
-            Write-Diag "$Label retrieveEnrollmentTimeDeviceMembershipTarget failed."
-            Write-Diag "  with body {} : HTTP $($firstError.Status) $($firstError.Message)"
-            Write-Diag "  without body : HTTP $($script:LastGraphError.Status) $($script:LastGraphError.Message)"
-            if ($firstError.Raw) { Write-Diag "  response     : $($firstError.Raw)" }
-            return $groupIds
+    if ($script:EtgEndpointCache.ContainsKey($CollectionKey)) {
+        $known = $script:EtgEndpointCache[$CollectionKey]
+        if ($null -eq $known) { return $groupIds }   # already established that nothing answers here
+        $candidates = @($known)
+    }
+
+    foreach ($candidate in $candidates) {
+
+        $uri = if ($candidate.Expand) {
+            "$ResourceUri`?`$expand=$($candidate.Expand)"
+        } else {
+            "$ResourceUri/$($candidate.Segment)"
         }
+        $describe = "$($candidate.Method) $(if ($candidate.Expand) { "?`$expand=$($candidate.Expand)" } else { $candidate.Segment })"
+
+        $script:LastGraphError = $null
+        $result = Invoke-GraphApi -Uri $uri -Method $candidate.Method -Body $candidate.Body -Quiet
+
+        if ($null -eq $result) {
+            Write-Diag "$Label $describe -> HTTP $($script:LastGraphError.Status) $($script:LastGraphError.Message)"
+            continue
+        }
+
+        $hits = [System.Collections.Generic.List[string]]::new()
+        foreach ($id in (Get-TargetIdFromObject -Node $result)) {
+            if ($hits -notcontains $id) { $hits.Add($id) }
+        }
+
+        if ($candidate.RequireHit -and $hits.Count -eq 0) {
+            Write-Diag "$Label $describe -> answered but produced no group, not treating it as the endpoint."
+            continue
+        }
+
+        Write-Diag "$Label $describe -> $($result | ConvertTo-Json -Depth 10 -Compress)"
+
+        if (-not $script:EtgEndpointCache.ContainsKey($CollectionKey)) {
+            $script:EtgEndpointCache[$CollectionKey] = $candidate
+            Write-Info "Enrolment time grouping on $CollectionKey is served by: $describe"
+        }
+
+        return $hits
     }
 
-    Write-Diag "$Label retrieveEnrollmentTimeDeviceMembershipTarget returned:"
-    Write-Diag "  $($result | ConvertTo-Json -Depth 10 -Compress)"
-
-    foreach ($id in (Get-TargetIdFromObject -Node $result)) {
-        if ($groupIds -notcontains $id) { $groupIds.Add($id) }
+    if (-not $script:EtgEndpointCache.ContainsKey($CollectionKey)) {
+        $script:EtgEndpointCache[$CollectionKey] = $null
+        Write-Warn "No enrolment time grouping endpoint on $CollectionKey answered in this tenant."
+        Write-Info "Run with -Diagnose to see each attempt, or supply -GroupMap to map profiles to groups by hand."
     }
-
-    if ($groupIds.Count -eq 0) { Write-Diag "$Label no targetId found in the response." }
 
     return $groupIds
 }
@@ -663,7 +720,7 @@ function Get-EnrolmentPolicyGroup {
 
         Write-Diag "$label id=$($policy.id) platforms=$($policy.platforms) technologies=$($policy.technologies) templateFamily=$($policy.templateReference.templateFamily)"
 
-        foreach ($id in (Get-EtgTargetFromAction -ResourceUri "$GraphBeta/deviceManagement/configurationPolicies('$($policy.id)')" -Label $label)) {
+        foreach ($id in (Get-EtgTarget -ResourceUri "$GraphBeta/deviceManagement/configurationPolicies('$($policy.id)')" -CollectionKey 'configurationPolicies' -Label $label)) {
             if ($groupIds -notcontains $id) { $groupIds.Add($id) }
         }
 
@@ -673,16 +730,15 @@ function Get-EnrolmentPolicyGroup {
             Write-Diag "$label settings could not be read: HTTP $($script:LastGraphError.Status) $($script:LastGraphError.Message)"
         }
         foreach ($setting in @($settings)) {
-            Write-Diag "$label setting $($setting.settingInstance.settingDefinitionId)"
+            # Full JSON, not just the definition ID — a group nested under an unrelated
+            # parent setting would otherwise be invisible here.
+            Write-Diag "$label setting $($setting.settingInstance.settingDefinitionId) :: $($setting.settingInstance | ConvertTo-Json -Depth 12 -Compress)"
             foreach ($id in (Get-GuidValueFromSetting -Instance $setting.settingInstance)) {
                 if ($groupIds -notcontains $id) { $groupIds.Add($id) }
             }
         }
 
-        if ($groupIds.Count -eq 0) {
-            Write-Diag "$label no enrolment time group found."
-            continue
-        }
+        if ($groupIds.Count -eq 0) { Write-Diag "$label no enrolment time group found." }
 
         $platform = [string]$policy.platforms
         $type = if ($platform -match '(?i)windows') {
@@ -734,8 +790,7 @@ function Get-AndroidEnrolmentProfileGroup {
         $label = "[android '$($enrolProfile.displayName)']"
         Write-Diag "$label id=$($enrolProfile.id) enrollmentMode=$($enrolProfile.enrollmentMode)"
 
-        $groupIds = @(Get-EtgTargetFromAction -ResourceUri "$GraphBeta/deviceManagement/androidDeviceOwnerEnrollmentProfiles/$($enrolProfile.id)" -Label $label)
-        if ($groupIds.Count -eq 0) { continue }
+        $groupIds = @(Get-EtgTarget -ResourceUri "$GraphBeta/deviceManagement/androidDeviceOwnerEnrollmentProfiles/$($enrolProfile.id)" -CollectionKey 'androidDeviceOwnerEnrollmentProfiles' -Label $label)
 
         $output.Add([PSCustomObject]@{
             ProfileType = 'AndroidEnterprise'
@@ -811,14 +866,11 @@ function Get-AppleEnrolmentProfileGroup {
             # worth a quiet attempt before giving up on the profile.
             $groupIds = @($groupIds | Where-Object { $_ })
             if ($groupIds.Count -eq 0) {
-                $groupIds = @(Get-EtgTargetFromAction -ResourceUri "$profileUri/$($enrolProfile.id)" -Label $label)
+                $groupIds = @(Get-EtgTarget -ResourceUri "$profileUri/$($enrolProfile.id)" -CollectionKey 'depEnrollmentProfiles' -Label $label)
             }
 
             $groupIds = @($groupIds | Where-Object { $_ })
-            if ($groupIds.Count -eq 0) {
-                Write-Diag "$label no enrolment time group found."
-                continue
-            }
+            if ($groupIds.Count -eq 0) { Write-Diag "$label no enrolment time group found." }
 
             $output.Add([PSCustomObject]@{
                 ProfileType = 'AppleEnrolment'
@@ -1098,12 +1150,39 @@ $profiles = @($profiles | Where-Object {
     $_.ProfileName -like $ProfileName
 })
 
+$discovered = $profiles.Count
+
+# -GroupMap fills in profiles whose group could not be read from Graph. Keys are matched
+# with -like, so both exact names and patterns work. Mapped groups are merged with
+# anything already discovered rather than replacing it.
+if ($GroupMap) {
+    foreach ($enrolProfile in $profiles) {
+        foreach ($pattern in $GroupMap.Keys) {
+            if ($enrolProfile.ProfileName -notlike $pattern) { continue }
+            $merged = [System.Collections.Generic.List[string]]::new()
+            foreach ($existing in @($enrolProfile.GroupIds)) { if ($existing) { $merged.Add([string]$existing) } }
+            foreach ($mapped in @($GroupMap[$pattern])) {
+                if ($mapped -and $merged -notcontains $mapped) { $merged.Add([string]$mapped) }
+            }
+            $enrolProfile.GroupIds = @($merged)
+            $enrolProfile.Source   = "$($enrolProfile.Source) + GroupMap"
+        }
+    }
+}
+
+# Only profiles that ended up with at least one group can be checked
+$profiles = @($profiles | Where-Object { @($_.GroupIds).Count -gt 0 })
+
 if ($profiles.Count -eq 0) {
     Write-Host ""
     Write-Warn "No enrolment profiles with enrolment time grouping were found for the selected types."
-    if (-not $Diagnose) {
-        Write-Info "Profiles were found but none reported a group. Re-run with -Diagnose to see"
-        Write-Info "exactly what each enrolment time grouping call returned."
+    if ($discovered -gt 0) {
+        Write-Info "$discovered profile(s) were found, but none reported a group."
+        if (-not $Diagnose) {
+            Write-Info "Re-run with -Diagnose to see what each enrolment time grouping call returned."
+        }
+        Write-Info "If the groups are set in the portal but Graph will not return them, map them by hand:"
+        Write-Info "  -GroupMap @{ 'DP_Cope' = '<group object id>'; 'IOS_*' = @('<id1>','<id2>') }"
     }
     Write-Host ""
     exit 0

@@ -184,6 +184,7 @@ directory object ID resolved from `managedDevice.azureADDeviceId`.
 | `-ReportPath` | Export the full result set to CSV |
 | `-SkipAutopilotEvents` | Skip the Autopilot events query |
 | `-Diagnose` | Print what every enrolment time grouping call actually returned |
+| `-GroupMap` | Map profile names to group IDs by hand when Graph will not return them |
 | `-WhatIf` | Show what would be added without adding it |
 
 The script also returns the result objects to the pipeline, so you can filter them
@@ -237,4 +238,39 @@ That distinguishes the three causes that look identical without it:
 Group IDs are harvested by property name (`targetId`, `groupId`,
 `enrollmentTimeAzureAdGroupIds`) anywhere in the response rather than by a fixed path,
 so a shape change reports a missing group loudly instead of returning an empty result.
+
+### The tenant will not return the group at all
+
+Some tenants reject the documented action outright:
+
+```
+400 No OData route exists that match template ~/singleton/navigation/key/action
+    with http verb POST
+```
+
+That wording says the action is present in the model but no route is registered for
+that verb and shape, so the script probes the plausible variants — POST and GET, the
+`retrieve` and `get` names, the fully qualified action name, the navigation property,
+and an `$expand` — and caches whichever one answers, per collection. When one works it
+says so:
+
+```
+Enrolment time grouping on configurationPolicies is served by: GET retrieveEnrollmentTimeDeviceMembershipTarget
+```
+
+If none answer, map the groups by hand and everything downstream works unchanged:
+
+```powershell
+.\Sync-IntuneEnrolmentTimeGroups.ps1 -TenantId contoso.onmicrosoft.com -Remediate -GroupMap @{
+    'DP_Cope'                      = '11111111-2222-3333-4444-555555555555'
+    'IOS_D_COPE_ADE_UserAffinity'  = '66666666-7777-8888-9999-000000000000'
+}
+```
+
+Keys are matched with `-like`, so `'IOS_*'` works too. Mapped groups are merged with
+anything the script discovered on its own, and the profile's `Source` column records
+that the group came from the map.
+
+Copy the group object ID from Entra ID > Groups > the group > **Object Id**, or from the
+enrolment profile's device group page in Intune.
 
