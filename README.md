@@ -249,10 +249,15 @@ Some tenants reject the documented action outright:
 ```
 
 That wording says the action is present in the model but no route is registered for
-that verb and shape, so the script probes the plausible variants — POST and GET, the
-`retrieve` and `get` names, the fully qualified action name, the navigation property,
-and an `$expand` — and caches whichever one answers, per collection. When one works it
-says so:
+**that verb**. In practice these tenants serve the same call over `GET`:
+
+```
+GET https://graph.microsoft.com/beta/deviceManagement/androidDeviceOwnerEnrollmentProfiles/{id}/retrieveEnrollmentTimeDeviceMembershipTarget
+```
+
+so `GET` is tried first, then POST with and without a body, the `get` name, the fully
+qualified action name, the navigation property, and an `$expand`. Whichever answers is
+cached per collection, so the probe cost is paid once. When one works it says so:
 
 ```
 Enrolment time grouping on configurationPolicies is served by: GET retrieveEnrollmentTimeDeviceMembershipTarget

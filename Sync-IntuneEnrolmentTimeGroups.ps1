@@ -177,6 +177,8 @@ param (
 # ============================================================
 #  Shared config
 # ============================================================
+$ScriptVersion = '1.3.0'
+
 $GraphBeta   = 'https://graph.microsoft.com/beta'
 $GraphV1     = 'https://graph.microsoft.com/v1.0'
 $Authority   = 'https://login.microsoftonline.com'
@@ -578,9 +580,11 @@ function Get-EtgTarget {
     $groupIds = [System.Collections.Generic.List[string]]::new()
 
     $candidates = @(
+        # GET first. The documented verb is POST, but live tenants serve this over GET and
+        # reject POST outright, so trying GET first avoids two doomed calls per collection.
+        [PSCustomObject]@{ Method = 'GET';  Segment = 'retrieveEnrollmentTimeDeviceMembershipTarget';                 Body = $null; Expand = $null; RequireHit = $false }
         [PSCustomObject]@{ Method = 'POST'; Segment = 'retrieveEnrollmentTimeDeviceMembershipTarget';                 Body = '{}';  Expand = $null; RequireHit = $false }
         [PSCustomObject]@{ Method = 'POST'; Segment = 'retrieveEnrollmentTimeDeviceMembershipTarget';                 Body = $null; Expand = $null; RequireHit = $false }
-        [PSCustomObject]@{ Method = 'GET';  Segment = 'retrieveEnrollmentTimeDeviceMembershipTarget';                 Body = $null; Expand = $null; RequireHit = $false }
         [PSCustomObject]@{ Method = 'POST'; Segment = 'microsoft.graph.retrieveEnrollmentTimeDeviceMembershipTarget'; Body = '{}';  Expand = $null; RequireHit = $false }
         [PSCustomObject]@{ Method = 'GET';  Segment = 'getEnrollmentTimeDeviceMembershipTarget';                      Body = $null; Expand = $null; RequireHit = $false }
         [PSCustomObject]@{ Method = 'POST'; Segment = 'getEnrollmentTimeDeviceMembershipTarget';                      Body = '{}';  Expand = $null; RequireHit = $false }
@@ -1091,6 +1095,7 @@ function Add-DeviceToGroup {
 #  Main
 # ============================================================
 Write-Header "Intune Enrolment Time Grouping — Audit and Sync"
+Write-Info "Script version $ScriptVersion on PowerShell $($PSVersionTable.PSVersion)"
 
 # --- Connect ---------------------------------------------------------------
 if ($AccessToken) {
